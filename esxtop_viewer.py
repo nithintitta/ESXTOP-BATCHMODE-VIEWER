@@ -26,10 +26,11 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -53,13 +54,25 @@ def open_maybe_gzip(path):
     return open(path, "r", newline="", encoding="utf-8", errors="replace")
 
 
-def parse_timestamp(raw):
+def parse_pdh_tz(header0):
+    """Parse the PDH-CSV timezone marker, e.g. '(PDH-CSV 4.0) (UTC)(0)' or
+    '(PDH-CSV 4.0) (Pacific Daylight Time)(-420)', where the trailing number
+    is the UTC bias in minutes for the timestamps in this file. Returns a
+    tzinfo, or None if the header doesn't carry a recognizable marker."""
+    m = re.search(r"\(PDH-CSV[^)]*\)\s*\([^)]*\)\((-?\d+)\)", header0)
+    if not m:
+        return None
+    return timezone(timedelta(minutes=int(m.group(1))))
+
+
+def parse_timestamp(raw, tzinfo=None):
     """esxtop batch timestamps look like '06/25/2026 14:30:05' (+ optional .ms)."""
     s = raw.strip().strip('"')
     for fmt in ("%m/%d/%Y %H:%M:%S.%f", "%m/%d/%Y %H:%M:%S",
                 "%d/%m/%Y %H:%M:%S.%f", "%d/%m/%Y %H:%M:%S"):
         try:
-            return datetime.strptime(s, fmt)
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=tzinfo) if tzinfo else dt
         except ValueError:
             continue
     return None
@@ -80,15 +93,22 @@ def parse_counter_path(path):
 
 
 def classify_category(group):
-    """Bucket an esxtop group name into CPU / Memory / Storage / Network / Other."""
+    """Bucket an esxtop group name into CPU / Power / Memory / Network /
+    Disk Adapter / Disk Device / Storage / Other."""
     g = group.lower()
-    if any(k in g for k in ("disk", "vsan", "datastore", "scsi", "lun", "vscsi")):
+    if "vsan" in g or "virtual disk" in g:
         return "Storage"
+    if "disk" in g and "adapter" in g:
+        return "Disk Adapter"
+    if "disk" in g or "datastore" in g or "scsi" in g or "lun" in g or "vscsi" in g:
+        return "Disk Device"
     if "network" in g or "vmnic" in g or g.startswith("net") or g.endswith("nic"):
         return "Network"
+    if "power" in g:
+        return "Power"
     if "mem" in g or "numa" in g:
         return "Memory"
-    if any(k in g for k in ("cpu", "vcpu", "interrupt", "power")):
+    if any(k in g for k in ("cpu", "vcpu", "interrupt")):
         return "CPU"
     return "Other"
 
@@ -120,7 +140,9 @@ def load_csv(path):
         except StopIteration:
             sys.exit("Empty file.")
 
-        # header[0] is the PDH marker; header[1:] are counter paths.
+        # header[0] is the PDH marker (carries the capture's UTC bias);
+        # header[1:] are counter paths.
+        tzinfo = parse_pdh_tz(header[0].strip().strip('"'))
         cols = header[1:]
         counters = []
         for i, c in enumerate(cols):
@@ -138,7 +160,7 @@ def load_csv(path):
         for row in reader:
             if not row:
                 continue
-            raw_ts.append(parse_timestamp(row[0]))
+            raw_ts.append(parse_timestamp(row[0], tzinfo=tzinfo))
             vals = row[1:]
             for i in range(ncols):
                 v = vals[i].strip().strip('"') if i < len(vals) else ""
@@ -264,8 +286,31 @@ INDEX_HTML = """<!doctype html>
 <script>
 let META = null, selected = new Set(), chart = null, lastData = null;
 let expanded = new Set();
-const CATEGORIES = ['CPU', 'Memory', 'Storage', 'Network', 'Other'];
+const CATEGORIES = ['CPU', 'Power', 'Memory', 'Network', 'Disk Adapter', 'Disk Device', 'Storage', 'Other'];
 const $ = s => document.querySelector(s);
+
+// Opening a category for the first time auto-selects & plots this (group, metric)
+// across all its instances - e.g. opening "CPU" selects "% Processor Time" for
+// every physical core. metric: null means "every metric in this group" (small groups).
+const CATEGORY_DEFAULTS = {
+  'CPU':          { group: 'Physical Cpu',           metric: '% Processor Time' },
+  'Power':        { group: 'PCPU Power State',       metric: '%C-State C0' },
+  'Memory':       { group: 'Memory',                 metric: null },
+  'Network':      { group: 'Network Port',           metric: 'MBits Received/sec' },
+  'Disk Adapter': { group: 'Physical Disk Adapter',  metric: 'Average Kernel MilliSec/Command' },
+  'Disk Device':  { group: 'Physical Disk SCSI Device', metric: 'Average Kernel MilliSec/Command' },
+  'Storage':      { group: 'Virtual Disk',           metric: 'Latency' },
+};
+
+// Selecting a (group, metric) bundle that fans out this wide (e.g. Interrupt
+// Cookie, Vcpu) would hand uPlot thousands of series and hang the browser.
+const MAX_BULK_SELECT = 300;
+
+function idsFor(group, metric) {
+  return META.counters
+    .filter(c => c.group === group && (metric == null || c.metric === metric))
+    .map(c => c.id);
+}
 // Friendly chip label -> the real Perfmon counter name to search for.
 const PRESETS = [
   { label: 'CPU Ready',          q: '% Ready' },
@@ -379,9 +424,98 @@ function makeRow(c) {
   return row;
 }
 
+function bulkSetChecked(container, ids, on) {
+  ids.forEach(id => on ? selected.add(id) : selected.delete(id));
+  container.querySelectorAll('input[type=checkbox][data-id]').forEach(k => {
+    k.checked = selected.has(+k.dataset.id);
+  });
+}
+
+// A leaf row for one instance under a metric bundle, e.g. "PCPU 0" under
+// CPU > % Processor Time, or a vcpu/world name under CPU > % Ready.
+function makeInstanceRow(c) {
+  const row = document.createElement('label'); row.className = 'item';
+  row.style.paddingLeft = '40px';
+  const cb = document.createElement('input'); cb.type = 'checkbox'; cb.dataset.id = c.id;
+  cb.checked = selected.has(c.id);
+  cb.onchange = () => { cb.checked ? selected.add(c.id) : selected.delete(c.id); updateSelCount(); };
+  const txt = document.createElement('span');
+  const s = c.stats || {};
+  const stat = s.count ? '<i> &middot; avg ' + s.avg + ' &middot; max ' + s.max + '</i>' : '';
+  txt.innerHTML = '<i>' + c.group + '</i> ' + (c.instance || '(host)') + stat;
+  row.appendChild(cb); row.appendChild(txt);
+  return row;
+}
+
+// One row per metric bundle in browse mode - a single checkbox selects/
+// deselects every instance of that metric at once (e.g. all CPU cores),
+// instead of ticking each instance individually. Instances are merged across
+// esxtop groups that share the metric (e.g. "% Ready" combines Vcpu and Group
+// Cpu instances into one node), since they're the same measurement. The caret
+// expands the bundle into its individual instances for fine-grained pick.
+function makeGroupRow(metric, items) {
+  const ids = items.map(c => c.id);
+  const groups = [...new Set(items.map(c => c.group))].sort();
+  const wrap = document.createElement('div');
+
+  const row = document.createElement('div');
+  row.className = 'item'; row.style.paddingLeft = '18px';
+  row.style.display = 'flex'; row.style.alignItems = 'baseline'; row.style.gap = '6px';
+
+  const caret = document.createElement('span');
+  caret.className = 'caret'; caret.textContent = '\\u25b8'; caret.style.cursor = 'pointer';
+
+  const cb = document.createElement('input'); cb.type = 'checkbox';
+  const allIn = ids.every(id => selected.has(id));
+  cb.checked = allIn;
+  cb.indeterminate = !allIn && ids.some(id => selected.has(id));
+
+  const kids = document.createElement('div'); kids.style.display = 'none';
+  let built = false;
+
+  cb.onchange = () => {
+    if (cb.checked) {
+      if (ids.length > MAX_BULK_SELECT &&
+          !confirm('Select all ' + ids.length + ' instances of "' + metric + '"? ' +
+                   'This may freeze the chart.')) {
+        cb.checked = false;
+        return;
+      }
+    }
+    bulkSetChecked(kids, ids, cb.checked);
+    updateSelCount();
+  };
+
+  caret.onclick = () => {
+    const open = kids.style.display !== 'none';
+    if (open) { kids.style.display = 'none'; caret.textContent = '\\u25b8'; return; }
+    if (!built) {
+      items.slice()
+        .sort((a, b) => (a.instance || '').localeCompare(b.instance || '', undefined, { numeric: true }))
+        .forEach(c => kids.appendChild(makeInstanceRow(c)));
+      built = true;
+    }
+    kids.style.display = 'block';
+    caret.textContent = '\\u25be';
+  };
+
+  const txt = document.createElement('span');
+  txt.innerHTML = '<b>' + metric + '</b> <i>' + groups.join(', ') + '</i>' +
+                   '<span class="catn" style="margin-left:6px">' + ids.length + '</span>';
+  row.appendChild(caret); row.appendChild(cb); row.appendChild(txt);
+  wrap.appendChild(row); wrap.appendChild(kids);
+  return wrap;
+}
+
+// With no search text we're "browsing": group each category's counters by
+// metric so e.g. all 100+ physical cores collapse into one "% Processor Time"
+// row instead of 100+ individual checkboxes, and metrics shared across esxtop
+// groups (like "% Ready" on both Vcpu and Group Cpu) merge into one node. A
+// search narrows to specific instances (e.g. a VM name), so it stays a flat list.
 function renderList(q) {
   const list = $('#list'); list.innerHTML = '';
   const matches = currentMatches(q);
+  const browsing = !(q || '').trim();
   const buckets = {}; CATEGORIES.forEach(c => buckets[c] = []);
   for (const c of matches) (buckets[c.category] || buckets['Other']).push(c);
   const PER_CAT = 400;
@@ -392,14 +526,64 @@ function renderList(q) {
     const hdr = document.createElement('div'); hdr.className = 'cat';
     hdr.innerHTML = '<span class="caret">' + (open ? '\\u25be' : '\\u25b8') + '</span>' +
                     '<b>' + cat + '</b><span class="catn">' + items.length + '</span>';
-    hdr.onclick = () => { open ? expanded.delete(cat) : expanded.add(cat); renderList(q); };
+    hdr.onclick = () => {
+      if (open) { expanded.delete(cat); renderList(q); return; }
+      expanded.add(cat);
+      const def = browsing && CATEGORY_DEFAULTS[cat];
+      if (def) {
+        const ids = idsFor(def.group, def.metric);
+        if (ids.length) {
+          selected = new Set(ids);
+          updateSelCount();
+          fetchAndDraw(ids);
+        }
+      }
+      renderList(q);
+    };
+    const ctrl = document.createElement('span');
+    ctrl.style.marginLeft = 'auto'; ctrl.style.display = 'flex'; ctrl.style.gap = '8px';
+    const selAll = document.createElement('a');
+    selAll.textContent = 'select all'; selAll.title = 'Select every counter in ' + cat;
+    selAll.style.cssText = 'font-size:11px;cursor:pointer;color:#2a6ebb;text-decoration:underline';
+    selAll.onclick = (e) => {
+      e.stopPropagation();
+      const ids = items.map(c => c.id);
+      if (ids.length > MAX_BULK_SELECT &&
+          !confirm('Select all ' + ids.length + ' counters in "' + cat + '"? ' +
+                   'This may freeze the chart.')) return;
+      ids.forEach(id => selected.add(id));
+      updateSelCount();
+      renderList(q);
+    };
+    const clearAll = document.createElement('a');
+    clearAll.textContent = 'deselect all'; clearAll.title = 'Deselect every counter in ' + cat;
+    clearAll.style.cssText = 'font-size:11px;cursor:pointer;color:#2a6ebb;text-decoration:underline';
+    clearAll.onclick = (e) => {
+      e.stopPropagation();
+      items.forEach(c => selected.delete(c.id));
+      updateSelCount();
+      renderList(q);
+    };
+    ctrl.appendChild(selAll); ctrl.appendChild(clearAll);
+    hdr.appendChild(ctrl);
     list.appendChild(hdr);
     if (!open) return;
-    items.slice(0, PER_CAT).forEach(c => list.appendChild(makeRow(c)));
-    if (items.length > PER_CAT) {
-      const m = document.createElement('div'); m.className = 'more';
-      m.textContent = '... ' + (items.length - PER_CAT) + ' more in ' + cat + ' - refine your filter';
-      list.appendChild(m);
+    if (browsing) {
+      const subgroups = new Map();
+      items.forEach(c => {
+        if (!subgroups.has(c.metric)) subgroups.set(c.metric, { metric: c.metric, items: [] });
+        subgroups.get(c.metric).items.push(c);
+      });
+      [...subgroups.values()]
+        .sort((a, b) => a.metric.localeCompare(b.metric))
+        .forEach(sg => list.appendChild(makeGroupRow(sg.metric, sg.items)));
+    } else {
+      items.slice(0, PER_CAT).forEach(c => list.appendChild(makeRow(c)));
+      if (items.length > PER_CAT) {
+        const m = document.createElement('div'); m.className = 'more';
+        m.textContent = '... ' + (items.length - PER_CAT) + ' more in ' + cat + ' - refine your filter';
+        list.appendChild(m);
+      }
     }
   });
   if (!matches.length) {
